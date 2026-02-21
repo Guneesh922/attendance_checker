@@ -1,0 +1,13 @@
+# Install in this order: cmake and dlib must come before face-recognition
+
+cmake
+dlib==19.24.2
+face-recognition==1.3.0
+
+opencv-python==4.9.0.80
+Pillow==10.2.0
+numpy==1.26.4
+customtkinter==5.2.2
+
+# WhatsApp report feature
+requests>=2.31.0
