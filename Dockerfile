@@ -21,19 +21,21 @@ WORKDIR /app
 # Limit compilation to 1 thread to prevent OOM
 ENV CMAKE_BUILD_PARALLEL_LEVEL=1
 
+# Fix for newer CMake compatibility with dlib 19.24.2
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
+
 # Install pip dependencies and upgrade build tools
 RUN pip install --upgrade pip setuptools wheel
 
-# Fix for newer CMake compatibility with dlib 19.24.2
-ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
+# COPY requirements before installing — this line was missing
+COPY requirements.txt .
 
 RUN pip install --no-cache-dir dlib==19.24.2
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy the rest of the code
 COPY . .
 
 EXPOSE 8000
 
-# --workers 1 is intentional: face_recognition is CPU-bound and the
-# in-memory encoding list is not safe to share across forked workers.
 CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
