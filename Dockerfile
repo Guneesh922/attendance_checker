@@ -4,6 +4,7 @@ FROM python:3.10-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     build-essential \
+    python3-dev \
     libopenblas-dev \
     liblapack-dev \
     libx11-dev \
@@ -20,6 +21,10 @@ COPY requirements.txt .
 
 # dlib must be installed BEFORE face-recognition (order is mandatory)
 RUN pip install --no-cache-dir cmake
+
+# Limit compilation to 1 thread to prevent Railway's free tier from running out of memory (OOM kill)
+ENV CMAKE_BUILD_PARALLEL_LEVEL=1
+
 RUN pip install --no-cache-dir dlib==19.24.2
 RUN pip install --no-cache-dir -r requirements.txt
 
