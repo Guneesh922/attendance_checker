@@ -18,13 +18,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-COPY requirements.txt .
-
 # Limit compilation to 1 thread to prevent OOM
 ENV CMAKE_BUILD_PARALLEL_LEVEL=1
 
-# Install pip dependencies
-RUN pip install --upgrade pip
+# Install pip dependencies and upgrade build tools
+RUN pip install --upgrade pip setuptools wheel
+
+# Fix for newer CMake compatibility with dlib 19.24.2
+ENV CMAKE_POLICY_VERSION_MINIMUM=3.5
+
 RUN pip install --no-cache-dir dlib==19.24.2
 RUN pip install --no-cache-dir -r requirements.txt
 
