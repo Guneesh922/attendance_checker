@@ -1,8 +1,9 @@
 FROM python:3.10-slim
 
-# System deps required by dlib (C++ compile) and OpenCV
+# Install system dependencies required by dlib and OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
+    g++ \
     build-essential \
     python3-dev \
     libopenblas-dev \
@@ -19,12 +20,11 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# dlib must be installed BEFORE face-recognition (order is mandatory)
-RUN pip install --no-cache-dir cmake
-
-# Limit compilation to 1 thread to prevent Railway's free tier from running out of memory (OOM kill)
+# Limit compilation to 1 thread to prevent OOM
 ENV CMAKE_BUILD_PARALLEL_LEVEL=1
 
+# Install pip dependencies
+RUN pip install --upgrade pip
 RUN pip install --no-cache-dir dlib==19.24.2
 RUN pip install --no-cache-dir -r requirements.txt
 
