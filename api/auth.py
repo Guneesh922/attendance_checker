@@ -5,10 +5,8 @@ Firebase Admin SDK initialisation + ID token verification.
 
 Every protected FastAPI route uses verify_token() as a Depends() dependency.
 
-Environment variables required (one of the following):
-  FIREBASE_SERVICE_ACCOUNT_JSON — path to the service account key JSON file
-                                  e.g. /app/secrets/firebase-sa.json
-  FIREBASE_CREDENTIALS_JSON     — the actual JSON payload as a string
+Environment variables required:
+  FIREBASE_SERVICE_ACCOUNT_JSON — either a JSON string of the credentials OR a path to the file
 """
 
 import os
@@ -23,17 +21,20 @@ logger = logging.getLogger(__name__)
 # Initialise Firebase Admin once at module import time.
 # Guard prevents re-initialisation if the module is reloaded.
 if not firebase_admin._apps:
-    if "FIREBASE_CREDENTIALS_JSON" in os.environ:
+    env_val = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "")
+    
+    # Try parsing as a raw JSON string first (for Railway)
+    if env_val.strip().startswith("{"):
         import json
-        cert_dict = json.loads(os.environ["FIREBASE_CREDENTIALS_JSON"])
+        cert_dict = json.loads(env_val)
         cred = credentials.Certificate(cert_dict)
-        firebase_admin.initialize_app(cred)
-        logger.info("Firebase Admin SDK initialised from JSON environment variable")
+        logger.info("Firebase Admin SDK initialised from JSON string in environment")
     else:
-        sa_path = os.environ["FIREBASE_SERVICE_ACCOUNT_JSON"]
-        cred = credentials.Certificate(sa_path)
-        firebase_admin.initialize_app(cred)
-        logger.info(f"Firebase Admin SDK initialised from {sa_path}")
+        # Fallback to parsing it as a file path (for local dev)
+        cred = credentials.Certificate(env_val)
+        logger.info(f"Firebase Admin SDK initialised from file path {env_val}")
+        
+    firebase_admin.initialize_app(cred)
 
 bearer = HTTPBearer()
 
