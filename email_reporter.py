@@ -32,6 +32,31 @@ SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
 
+def validate_gmail_credentials(email: str, app_password: str) -> bool:
+    """
+    Validate Gmail credentials by attempting an SMTP login.
+
+    Args:
+        email: Gmail address.
+        app_password: Gmail App Password.
+
+    Returns:
+        True if authentication succeeds, False otherwise.
+    """
+    if not email or not app_password:
+        return False
+    if "@gmail.com" not in email.lower():
+        return False
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(email.strip(), app_password.strip())
+        return True
+    except Exception:
+        return False
+
+
 def send_email_report(sender: str, app_password: str,
                       recipients: str, subject: str, html_body: str) -> bool:
     """

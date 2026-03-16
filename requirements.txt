@@ -9,5 +9,21 @@ Pillow==10.2.0
 numpy==1.26.4
 customtkinter==5.2.2
 
-# WhatsApp report feature
+# HTTP / misc
 requests>=2.31.0
+
+# Web API layer
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+python-jose[cryptography]==3.3.0
+
+# PostgreSQL driver
+psycopg2-binary==2.9.9
+
+# Firebase Admin SDK (server-side token verification)
+firebase-admin==6.5.0
+
+# Image storage (replaces Firebase Storage)
+cloudinary==1.40.0
+

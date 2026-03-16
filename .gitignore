@@ -69,3 +69,11 @@ Desktop.ini
 *.spec
 dist/
 build/
+
+# ── Web / secrets (never commit these) ───────────────────────────────────────
+secrets/
+.env
+frontend/.env.local
+frontend/.next/
+frontend/node_modules/
+frontend/out/

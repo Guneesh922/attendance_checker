@@ -1,10 +1,13 @@
 import os
-import sqlite3
+import urllib.request
+import numpy
 import cv2
 import logging
 import time as time_module
 from datetime import datetime, date, time
 import face_recognition
+import requests
+from email_reporter import validate_gmail_credentials
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -16,6 +19,7 @@ MIN_WORK_HOURS = 4
 LATE_AFTER_TIME = time(9, 30)  # 9:30 AM
 # Default minimum departure time (e.g., end of workday)
 MIN_DEPARTURE_TIME = time(17, 0)  # 5:00 PM
+FIREBASE_AUTH_BASE_URL = "https://identitytoolkit.googleapis.com/v1/accounts"
 
 
 class AttendanceBackend:
@@ -33,14 +37,14 @@ class AttendanceBackend:
         self.image_dir = image_dir
 
         try:
-            if not os.path.exists(self.image_dir):
-                os.makedirs(self.image_dir)
-                logger.info(f"Created image directory: {self.image_dir}")
-
-            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+            from api.database import get_conn
+            self.conn = get_conn()
+            self.conn.autocommit = False
             self.cur = self.conn.cursor()
 
             self._create_tables()
+            self._ensure_owner_email_column()
+            self._ensure_employees_owner_id_column()
             self._cleanup_old_years()
             # Load persisted settings (overrides defaults) before loading faces
             self._load_settings()
@@ -68,9 +72,10 @@ class AttendanceBackend:
             # Owner table for authentication
             self.cur.execute("""
             CREATE TABLE IF NOT EXISTS owner (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT UNIQUE,
                 password TEXT,
+                email TEXT,
                 image_path TEXT,
                 created_at TEXT
             )
@@ -78,32 +83,33 @@ class AttendanceBackend:
 
             self.cur.execute("""
             CREATE TABLE IF NOT EXISTS employees (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE,
+                id SERIAL PRIMARY KEY,
+                owner_id INTEGER REFERENCES owner(id) ON DELETE CASCADE,
+                name TEXT,
                 role TEXT,
-                image_path TEXT
+                image_path TEXT,
+                UNIQUE(owner_id, name)
             )
             """)
 
             # Table for multiple images per employee
             self.cur.execute("""
             CREATE TABLE IF NOT EXISTS employee_images (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                employee_id INTEGER,
+                id SERIAL PRIMARY KEY,
+                employee_id INTEGER REFERENCES employees(id) ON DELETE CASCADE,
                 image_path TEXT,
-                created_at TEXT,
-                FOREIGN KEY (employee_id) REFERENCES employees(id)
+                blob_name TEXT,
+                created_at TEXT
             )
             """)
 
             self.cur.execute("""
             CREATE TABLE IF NOT EXISTS attendance (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                employee_id INTEGER,
+                id SERIAL PRIMARY KEY,
+                employee_id INTEGER REFERENCES employees(id) ON DELETE CASCADE,
                 date TEXT,
                 entry_time TEXT,
-                exit_time TEXT,
-                FOREIGN KEY (employee_id) REFERENCES employees(id)
+                exit_time TEXT
             )
             """)
             # Settings table to persist configurable thresholds
@@ -113,11 +119,69 @@ class AttendanceBackend:
                 value TEXT
             )
             """)
+            # Performance indexes (ignored if already exist)
+            self.cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_date ON attendance(date)")
+            self.cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_emp_date ON attendance(employee_id, date)")
             self.conn.commit()
             logger.info("Database tables created/verified")
         except Exception as e:
             logger.error(f"Error creating tables: {e}", exc_info=True)
             raise
+
+    def _ensure_owner_email_column(self):
+        """Ensure the owner table has an email column (PostgreSQL version)."""
+        try:
+            self.cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name='owner' AND column_name='email'
+            """)
+            if not self.cur.fetchone():
+                self.cur.execute("ALTER TABLE owner ADD COLUMN email TEXT")
+                self.conn.commit()
+                logger.info("Added owner.email column to existing database")
+        except Exception as e:
+            logger.error(f"Error ensuring owner.email column: {e}", exc_info=True)
+            raise
+
+    def _ensure_employees_owner_id_column(self):
+        """Add owner_id column to employees table for multi-tenant support."""
+        try:
+            self.cur.execute("""
+                SELECT column_name FROM information_schema.columns
+                WHERE table_name='employees' AND column_name='owner_id'
+            """)
+            if not self.cur.fetchone():
+                # Get the first (and typically only) owner ID
+                self.cur.execute("SELECT id FROM owner LIMIT 1")
+                owner_row = self.cur.fetchone()
+                owner_id = owner_row[0] if owner_row else 1
+                
+                # Add owner_id column with default value
+                self.cur.execute(f"ALTER TABLE employees ADD COLUMN owner_id INTEGER DEFAULT {owner_id}")
+                
+                # Add foreign key constraint
+                self.cur.execute("""
+                    ALTER TABLE employees 
+                    ADD CONSTRAINT fk_employees_owner 
+                    FOREIGN KEY (owner_id) REFERENCES owner(id) ON DELETE CASCADE
+                """)
+                
+                # Recreate unique constraint to include owner_id
+                try:
+                    self.cur.execute("ALTER TABLE employees DROP CONSTRAINT employees_name_key")
+                except:
+                    pass  # Constraint might not exist
+                
+                self.cur.execute("""
+                    ALTER TABLE employees 
+                    ADD CONSTRAINT employees_owner_name_unique UNIQUE(owner_id, name)
+                """)
+                
+                self.conn.commit()
+                logger.info("Added employees.owner_id column for multi-tenant support")
+        except Exception as e:
+            logger.error(f"Error ensuring employees.owner_id column: {e}", exc_info=True)
+            self.conn.rollback()
 
     def _cleanup_old_years(self):
         """Remove attendance records from previous years."""
@@ -125,7 +189,7 @@ class AttendanceBackend:
             current_year = datetime.now().year
             self.cur.execute("""
             DELETE FROM attendance
-            WHERE substr(date, 1, 4) < ?
+            WHERE substr(date, 1, 4) < %s
             """, (str(current_year),))
             deleted_count = self.cur.rowcount
             self.conn.commit()
@@ -137,7 +201,7 @@ class AttendanceBackend:
     # --------------------------------------------------
     # EMPLOYEES
     # --------------------------------------------------
-    def register_employee(self, name, role, frame, add_image=False):
+    def register_employee(self, name, role, frame, add_image=False, owner_id=None):
         """
         Register a new employee or add image to existing employee.
         
@@ -146,6 +210,7 @@ class AttendanceBackend:
             role: Employee role
             frame: OpenCV frame containing employee face
             add_image: If True and employee exists, add this image instead of replacing
+            owner_id: Owner ID for multi-tenant support (required for new employees)
             
         Raises:
             ValueError: If name or role is invalid
@@ -160,24 +225,19 @@ class AttendanceBackend:
         role = role.strip()
         
         try:
-            # Check if employee exists
-            self.cur.execute("SELECT id FROM employees WHERE name=?", (name,))
+            # Check if employee exists for this owner
+            if owner_id:
+                self.cur.execute("SELECT id FROM employees WHERE owner_id=%s AND name=%s", (owner_id, name))
+            else:
+                self.cur.execute("SELECT id FROM employees WHERE name=%s", (name,))
             emp_row = self.cur.fetchone()
             
-            safe_name = name.replace(" ", "_")
-            safe_role = role.replace(" ", "_")
-            
-            # Generate unique image filename with timestamp if adding image
-            if add_image and emp_row:
-                timestamp = int(time_module.time())
-                img_filename = f"{safe_name}_{safe_role}_{timestamp}.jpg"
-            else:
-                img_filename = f"{safe_name}_{safe_role}.jpg"
-            
-            img_path = os.path.join(self.image_dir, img_filename)
-
-            if not cv2.imwrite(img_path, frame):
-                raise IOError(f"Failed to save image to {img_path}")
+            from api.storage import upload_face_image
+            # Encode frame to JPEG bytes and upload to Firebase Storage
+            ok, buf = cv2.imencode(".jpg", frame)
+            if not ok:
+                raise IOError("Failed to encode frame as JPEG")
+            img_url, blob_name = upload_face_image(name, buf.tobytes())
 
             if emp_row:
                 # Employee exists
@@ -185,39 +245,38 @@ class AttendanceBackend:
                 if add_image:
                     # Add new image to employee_images table
                     self.cur.execute("""
-                    INSERT INTO employee_images (employee_id, image_path, created_at)
-                    VALUES (?, ?, ?)
-                    """, (emp_id, img_path, datetime.now().isoformat()))
+                    INSERT INTO employee_images (employee_id, image_path, blob_name, created_at)
+                    VALUES (%s, %s, %s, %s)
+                    """, (emp_id, img_url, blob_name, datetime.now().isoformat()))
                     logger.info(f"Added image to employee: {name}")
                 else:
-                    # Update role and main image_path (for backward compatibility)
+                    # Update role and main image_path
                     self.cur.execute("""
-                    UPDATE employees SET role=?, image_path=? WHERE id=?
-                    """, (role, img_path, emp_id))
-                    # Also add to employee_images if not already there
+                    UPDATE employees SET role=%s, image_path=%s WHERE id=%s
+                    """, (role, img_url, emp_id))
+                    # Also add to employee_images
                     self.cur.execute("""
-                    SELECT COUNT(*) FROM employee_images WHERE employee_id=? AND image_path=?
-                    """, (emp_id, img_path))
-                    if self.cur.fetchone()[0] == 0:
-                        self.cur.execute("""
-                        INSERT INTO employee_images (employee_id, image_path, created_at)
-                        VALUES (?, ?, ?)
-                        """, (emp_id, img_path, datetime.now().isoformat()))
+                    INSERT INTO employee_images (employee_id, image_path, blob_name, created_at)
+                    VALUES (%s, %s, %s, %s)
+                    """, (emp_id, img_url, blob_name, datetime.now().isoformat()))
                     logger.info(f"Updated employee: {name} ({role})")
             else:
                 # New employee
+                if not owner_id:
+                    raise ValueError("owner_id is required for new employees")
                 self.cur.execute("""
-                INSERT INTO employees (name, role, image_path)
-                VALUES (?, ?, ?)
-                """, (name, role, img_path))
-                emp_id = self.cur.lastrowid
-                # Add to employee_images table
+                INSERT INTO employees (owner_id, name, role, image_path)
+                VALUES (%s, %s, %s, %s)
+                """, (owner_id, name, role, img_url))
+                # psycopg2: use RETURNING id instead of lastrowid
+                self.cur.execute("SELECT id FROM employees WHERE owner_id=%s AND name=%s", (owner_id, name))
+                emp_id = self.cur.fetchone()[0]
                 self.cur.execute("""
-                INSERT INTO employee_images (employee_id, image_path, created_at)
-                VALUES (?, ?, ?)
-                """, (emp_id, img_path, datetime.now().isoformat()))
+                INSERT INTO employee_images (employee_id, image_path, blob_name, created_at)
+                VALUES (%s, %s, %s, %s)
+                """, (emp_id, img_url, blob_name, datetime.now().isoformat()))
                 logger.info(f"Registered new employee: {name} ({role})")
-            
+
             self.conn.commit()
             self._load_faces()
         except Exception as e:
@@ -238,7 +297,7 @@ class AttendanceBackend:
         """
         try:
             # Get employee role to pass to register_employee
-            self.cur.execute("SELECT role FROM employees WHERE name=?", (name,))
+            self.cur.execute("SELECT role FROM employees WHERE name=%s", (name,))
             emp_row = self.cur.fetchone()
             if not emp_row:
                 raise ValueError(f"Employee '{name}' not found")
@@ -261,7 +320,7 @@ class AttendanceBackend:
             List of image paths
         """
         try:
-            self.cur.execute("SELECT id FROM employees WHERE name=?", (name,))
+            self.cur.execute("SELECT id FROM employees WHERE name=%s", (name,))
             emp_row = self.cur.fetchone()
             if not emp_row:
                 return []
@@ -269,7 +328,7 @@ class AttendanceBackend:
             emp_id = emp_row[0]
             self.cur.execute("""
                 SELECT image_path FROM employee_images 
-                WHERE employee_id = ?
+                WHERE employee_id = %s
                 ORDER BY created_at
             """, (emp_id,))
             return [row[0] for row in self.cur.fetchall()]
@@ -301,7 +360,7 @@ class AttendanceBackend:
         try:
             # Find existing employee
             self.cur.execute(
-                "SELECT id, image_path FROM employees WHERE name=?",
+                "SELECT id, image_path FROM employees WHERE name=%s",
                 (old_name,),
             )
             row = self.cur.fetchone()
@@ -318,43 +377,33 @@ class AttendanceBackend:
             safe_new_role = new_role.replace(" ", "_")
             new_image_path = old_image_path
 
-            # If we have a new frame, save a new image
+            # If we have a new frame, upload to Firebase Storage
             if frame is not None:
-                new_image_path = os.path.join(
-                    self.image_dir,
-                    f"{safe_new_name}_{safe_new_role}.jpg",
-                )
-                if not cv2.imwrite(new_image_path, frame):
-                    raise IOError(f"Failed to save updated image to {new_image_path}")
-
-                # Remove old image file if it's different
-                if old_image_path and os.path.exists(old_image_path) and old_image_path != new_image_path:
-                    try:
-                        os.remove(old_image_path)
-                        logger.info(f"Deleted old image: {old_image_path}")
-                    except OSError as e:
-                        logger.warning(f"Could not delete old image {old_image_path}: {e}")
+                from api.storage import upload_face_image, delete_face_image
+                ok, buf = cv2.imencode(".jpg", frame)
+                if not ok:
+                    raise IOError("Failed to encode frame as JPEG")
+                # Delete old image from Firebase Storage (best-effort)
+                if old_image_path and old_image_path.startswith("https://"):
+                    # Retrieve blob_name from employee_images
+                    self.cur.execute("""
+                        SELECT blob_name FROM employee_images
+                        WHERE employee_id=%s ORDER BY created_at DESC LIMIT 1
+                    """, (emp_id,))
+                    bn_row = self.cur.fetchone()
+                    if bn_row and bn_row[0]:
+                        delete_face_image(bn_row[0])
+                new_image_path, _blob = upload_face_image(new_name, buf.tobytes())
             else:
-                # No new frame: try to rename existing image file to match new name/role
-                if old_image_path and os.path.exists(old_image_path):
-                    target_image_path = os.path.join(
-                        self.image_dir,
-                        f"{safe_new_name}_{safe_new_role}.jpg",
-                    )
-                    if old_image_path != target_image_path:
-                        try:
-                            os.rename(old_image_path, target_image_path)
-                            new_image_path = target_image_path
-                            logger.info(f"Renamed image {old_image_path} -> {target_image_path}")
-                        except OSError as e:
-                            logger.warning(f"Could not rename image {old_image_path}: {e}")
+                # No new frame — keep existing URL as-is, just update name/role in DB
+                new_image_path = old_image_path
 
             # Update employee record (keeps same ID so attendance is preserved)
             self.cur.execute(
                 """
                 UPDATE employees
-                SET name = ?, role = ?, image_path = ?
-                WHERE id = ?
+                SET name = %s, role = %s, image_path = %s
+                WHERE id = %s
                 """,
                 (new_name, new_role, new_image_path, emp_id),
             )
@@ -378,17 +427,20 @@ class AttendanceBackend:
             return
         
         try:
-            self.cur.execute("SELECT image_path FROM employees WHERE name=?", (name,))
-            row = self.cur.fetchone()
-            if row and os.path.exists(row[0]):
-                try:
-                    os.remove(row[0])
-                    logger.info(f"Deleted image: {row[0]}")
-                except OSError as e:
-                    logger.warning(f"Could not delete image {row[0]}: {e}")
+            # Delete all Firebase Storage images for this employee
+            from api.storage import delete_face_image
+            self.cur.execute("SELECT id FROM employees WHERE name=%s", (name,))
+            emp_row = self.cur.fetchone()
+            if emp_row:
+                self.cur.execute(
+                    "SELECT blob_name FROM employee_images WHERE employee_id=%s",
+                    (emp_row[0],)
+                )
+                for img_row in self.cur.fetchall():
+                    if img_row[0]:
+                        delete_face_image(img_row[0])
 
-            self.cur.execute("DELETE FROM employees WHERE name=?", (name,))
-            self.cur.execute("DELETE FROM attendance WHERE employee_id NOT IN (SELECT id FROM employees)")
+            self.cur.execute("DELETE FROM employees WHERE name=%s", (name,))
             self.conn.commit()
             self._load_faces()
             logger.info(f"Deleted employee: {name}")
@@ -397,15 +449,21 @@ class AttendanceBackend:
             self.conn.rollback()
             raise
 
-    def get_employee_list(self):
+    def get_employee_list(self, owner_id=None):
         """
-        Get list of all employees.
+        Get list of all employees, optionally filtered by owner.
         
+        Args:
+            owner_id: Optional owner ID to filter employees
+            
         Returns:
             List of tuples (name, role)
         """
         try:
-            self.cur.execute("SELECT name, role FROM employees ORDER BY name")
+            if owner_id:
+                self.cur.execute("SELECT name, role FROM employees WHERE owner_id=%s ORDER BY name", (owner_id,))
+            else:
+                self.cur.execute("SELECT name, role FROM employees ORDER BY name")
             return self.cur.fetchall()
         except Exception as e:
             logger.error(f"Error getting employee list: {e}", exc_info=True)
@@ -429,25 +487,32 @@ class AttendanceBackend:
                 # Get all images for this employee
                 self.cur.execute("""
                     SELECT image_path FROM employee_images 
-                    WHERE employee_id = ?
+                    WHERE employee_id = %s
                     ORDER BY created_at
                 """, (emp_id,))
                 image_paths = [row[0] for row in self.cur.fetchall()]
                 
                 # Fallback to legacy single image_path if no images in employee_images table
                 if not image_paths:
-                    self.cur.execute("SELECT image_path FROM employees WHERE id = ?", (emp_id,))
+                    self.cur.execute("SELECT image_path FROM employees WHERE id = %s", (emp_id,))
                     legacy_path = self.cur.fetchone()
                     if legacy_path and legacy_path[0]:
                         image_paths = [legacy_path[0]]
                 
-                # Load encodings from all images
+                # Load encodings from all images (downloaded from Firebase Storage URLs)
                 for path in image_paths:
-                    if not os.path.exists(path):
-                        logger.warning(f"Image not found for {name}: {path}")
+                    if not path or not path.startswith("https://"):
+                        logger.warning(f"Skipping invalid image URL for {name}: {path}")
                         continue
                     try:
-                        img = face_recognition.load_image_file(path)
+                        resp = requests.get(path, timeout=10)
+                        resp.raise_for_status()
+                        arr = numpy.frombuffer(resp.content, numpy.uint8)
+                        img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        if img_bgr is None:
+                            logger.warning(f"Could not decode image for {name}: {path}")
+                            continue
+                        img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                         enc = face_recognition.face_encodings(img)
                         if enc:
                             self.known_encodings.append(enc[0])
@@ -505,7 +570,7 @@ class AttendanceBackend:
 
     def get_setting(self, key, default=None):
         try:
-            self.cur.execute("SELECT value FROM settings WHERE key=?", (key,))
+            self.cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
             row = self.cur.fetchone()
             return row[0] if row else default
         except Exception as e:
@@ -514,7 +579,10 @@ class AttendanceBackend:
 
     def set_setting(self, key, value):
         try:
-            self.cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, str(value)))
+            self.cur.execute("""
+                INSERT INTO settings (key, value) VALUES (%s, %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, (key, str(value)))
             self.conn.commit()
             # reload in-memory settings
             self._load_settings()
@@ -527,6 +595,56 @@ class AttendanceBackend:
     # --------------------------------------------------
     # OWNER AUTHENTICATION
     # --------------------------------------------------
+    def _resolve_firebase_api_key(self, api_key=None):
+        """Resolve Firebase API key from arg, env, or settings."""
+        key = (api_key or "").strip()
+        if key:
+            return key
+        env_key = os.getenv("FIREBASE_API_KEY", "").strip()
+        if env_key:
+            return env_key
+        return (self.get_setting("firebase_api_key", "") or "").strip()
+
+    def _firebase_error_message(self, code):
+        """Map Firebase error code to a user-friendly message."""
+        mapping = {
+            "EMAIL_EXISTS": "This email is already registered.",
+            "INVALID_EMAIL": "Invalid email address format.",
+            "MISSING_PASSWORD": "Password is required.",
+            "WEAK_PASSWORD : Password should be at least 6 characters": "Password must be at least 6 characters.",
+            "WEAK_PASSWORD": "Password must be at least 6 characters.",
+            "INVALID_PASSWORD": "Incorrect password.",
+            "EMAIL_NOT_FOUND": "No account found for this email.",
+            "INVALID_LOGIN_CREDENTIALS": "Invalid email or password.",
+            "OPERATION_NOT_ALLOWED": "Email/password sign-in is not enabled in Firebase project.",
+        }
+        return mapping.get(code, f"Firebase error: {code}")
+
+    def _firebase_auth_request(self, action, payload, api_key):
+        """Call Firebase Identity Toolkit auth endpoint and return (ok, data_or_error_code)."""
+        if not api_key:
+            return False, "MISSING_API_KEY"
+
+        url = f"{FIREBASE_AUTH_BASE_URL}:{action}?key={api_key}"
+        try:
+            response = requests.post(url, json=payload, timeout=20)
+            data = response.json() if response.text else {}
+        except requests.RequestException as e:
+            logger.error(f"Firebase request error ({action}): {e}")
+            return False, "NETWORK_ERROR"
+        except Exception as e:
+            logger.error(f"Firebase parse error ({action}): {e}", exc_info=True)
+            return False, "INVALID_RESPONSE"
+
+        if response.ok and "error" not in data:
+            return True, data
+
+        err_code = (
+            data.get("error", {}).get("message")
+            if isinstance(data, dict) else None
+        ) or f"HTTP_{response.status_code}"
+        logger.warning(f"Firebase auth failed ({action}): {err_code}")
+        return False, err_code
     def owner_exists(self):
         """Check if owner is registered."""
         try:
@@ -537,56 +655,135 @@ class AttendanceBackend:
             logger.error(f"Error checking owner existence: {e}", exc_info=True)
             return False
 
-    def register_owner(self, name, password, frame):
+    def register_owner(self, name, password, frame=None, owner_email=None, firebase_api_key=None):
         """
-        Register the owner with face recognition.
+        Register the owner using Firebase email/password authentication.
         
         Args:
             name: Owner name
-            password: Owner password
-            frame: OpenCV frame containing owner face
+            password: Owner password (Firebase auth password)
+            frame: Legacy argument (unused)
+            owner_email: Owner email used for Firebase auth
+            firebase_api_key: Firebase Web API key
             
         Raises:
             ValueError: If owner already exists or invalid input
-            IOError: If image cannot be saved
         """
         if not name or not name.strip():
             raise ValueError("Owner name cannot be empty")
-        if not password or not password.strip():
-            raise ValueError("Password cannot be empty")
-        
-        if self.owner_exists():
-            raise ValueError("Owner already registered")
+        if not owner_email or "@" not in owner_email:
+            raise ValueError("Owner email is required")
+        if not password or len(password.strip()) < 6:
+            raise ValueError("Owner password must be at least 6 characters")
         
         name = name.strip()
-        password = password.strip()
+        password = (password or "").strip()
+        owner_email = (owner_email or "").strip().lower()
+        firebase_api_key = self._resolve_firebase_api_key(firebase_api_key)
+
+        if not firebase_api_key:
+            raise ValueError("Firebase API key is required")
         
         try:
-            # Save owner image
-            owner_dir = "Owner_Images"
-            if not os.path.exists(owner_dir):
-                os.makedirs(owner_dir)
-            
-            img_path = os.path.join(owner_dir, f"{name.replace(' ', '_')}.jpg")
-            if not cv2.imwrite(img_path, frame):
-                raise IOError(f"Failed to save owner image to {img_path}")
+            self.cur.execute("SELECT id FROM owner LIMIT 1")
+            existing_owner = self.cur.fetchone()
+            signup_payload = {
+                "email": owner_email,
+                "password": password,
+                "returnSecureToken": True
+            }
+            ok, signup_res = self._firebase_auth_request(
+                "signUp", signup_payload, firebase_api_key
+            )
+            if not ok:
+                # If already registered in Firebase, verify password by signing in.
+                if signup_res == "EMAIL_EXISTS":
+                    signin_payload = {
+                        "email": owner_email,
+                        "password": password,
+                        "returnSecureToken": True
+                    }
+                    ok_signin, signin_res = self._firebase_auth_request(
+                        "signInWithPassword", signin_payload, firebase_api_key
+                    )
+                    if not ok_signin:
+                        raise ValueError(
+                            f"Owner email already exists in Firebase, and sign-in failed: "
+                            f"{self._firebase_error_message(signin_res)}"
+                        )
+                else:
+                    raise ValueError(self._firebase_error_message(signup_res))
 
-            # Verify face is detected
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            encodings = face_recognition.face_encodings(rgb_frame)
-            if not encodings:
-                raise ValueError("No face detected in the image")
-            
-            # Store owner data
-            self.cur.execute("""
-            INSERT INTO owner (name, password, image_path, created_at)
-            VALUES (?, ?, ?, ?)
-            """, (name, password, img_path, datetime.now().isoformat()))
+            self.set_setting("firebase_api_key", firebase_api_key)
+            if existing_owner:
+                self.cur.execute(
+                    """
+                    UPDATE owner
+                    SET name=%s, password=%s, email=%s
+                    WHERE id=%s
+                    """,
+                    (name, "", owner_email, existing_owner[0])
+                )
+            else:
+                self.cur.execute("""
+                INSERT INTO owner (name, password, email, image_path, created_at)
+                VALUES (%s, %s, %s, %s, %s)
+                """, (name, "", owner_email, "", datetime.now().isoformat()))
             self.conn.commit()
             
-            logger.info(f"Owner registered: {name}")
+            logger.info(f"Owner Firebase auth configured: {name}")
         except Exception as e:
             logger.error(f"Error registering owner: {e}", exc_info=True)
+            self.conn.rollback()
+            raise
+
+    def register_owner_firebase(self, email, organization_name, firebase_uid):
+        """
+        Register a new owner/organization via Firebase authentication.
+        This is called when a new user signs up through the signup page.
+        
+        Args:
+            email: Owner email (already verified by Firebase)
+            organization_name: Name of the organization
+            firebase_uid: Firebase unique identifier for the owner
+            
+        Returns:
+            dict: Success/error response
+        """
+        try:
+            # Check if owner with this email already exists
+            self.cur.execute("SELECT id FROM owner WHERE email = %s", (email.lower(),))
+            existing = self.cur.fetchone()
+            
+            if existing:
+                logger.warning(f"Owner with email {email} already registered")
+                return {"status": "success", "message": "Owner account already exists"}
+            
+            # Insert new owner record
+            self.cur.execute("""
+                INSERT INTO owner (name, email, password, image_path, created_at, firebase_uid)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (
+                organization_name,
+                email.lower(),
+                "",  # Password is handled by Firebase
+                "",  # No face image for now
+                datetime.now().isoformat(),
+                firebase_uid
+            ))
+            
+            # Also store in settings for backward compatibility if needed
+            self.set_setting(f"owner_firebase_uid_{email}", firebase_uid)
+            
+            self.conn.commit()
+            logger.info(f"Owner registered via Firebase: {organization_name} ({email})")
+            
+            return {
+                "status": "success",
+                "message": f"Owner {organization_name} registered successfully"
+            }
+        except Exception as e:
+            logger.error(f"Error registering owner via Firebase: {e}", exc_info=True)
             self.conn.rollback()
             raise
 
@@ -639,9 +836,83 @@ class AttendanceBackend:
             logger.error(f"Error authenticating owner: {e}", exc_info=True)
             return False
 
+    def get_owner_email(self):
+        """Return stored owner email if present."""
+        try:
+            self.cur.execute("SELECT email FROM owner LIMIT 1")
+            row = self.cur.fetchone()
+            return (row[0] or "").strip().lower() if row else ""
+        except Exception as e:
+            logger.error(f"Error getting owner email: {e}", exc_info=True)
+            return ""
+
+    def get_owner_name(self):
+        """Return stored owner name if present."""
+        try:
+            self.cur.execute("SELECT name FROM owner LIMIT 1")
+            row = self.cur.fetchone()
+            return (row[0] or "").strip() if row else ""
+        except Exception as e:
+            logger.error(f"Error getting owner name: {e}", exc_info=True)
+            return ""
+
+    def get_owner_id_from_firebase_uid(self, firebase_uid: str) -> int:
+        """Get owner ID from Firebase UID (used for multi-tenant lookups)."""
+        try:
+            self.cur.execute("""
+                SELECT id FROM owner 
+                WHERE firebase_uid = %s
+            """, (firebase_uid,))
+            row = self.cur.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error getting owner ID from Firebase UID: {e}", exc_info=True)
+            return None
+
+    def validate_gmail_credentials(self, email, app_password):
+        """Validate Gmail login details using SMTP."""
+        try:
+            return validate_gmail_credentials(email, app_password)
+        except Exception:
+            return False
+
+    def authenticate_owner_gmail(self, email, app_password):
+        """
+        Authenticate owner using Gmail credentials.
+
+        If owner email is not set (legacy data), first successful login will bind the email.
+        """
+        try:
+            email = (email or "").strip().lower()
+            app_password = (app_password or "").strip()
+            if not email or not app_password:
+                return False
+            if "@gmail.com" not in email:
+                return False
+
+            self.cur.execute("SELECT id, email FROM owner LIMIT 1")
+            row = self.cur.fetchone()
+            if not row:
+                return False
+
+            owner_id, saved_email = row[0], (row[1] or "").strip().lower()
+            if saved_email and saved_email != email:
+                return False
+
+            if not validate_gmail_credentials(email, app_password):
+                return False
+
+            if not saved_email:
+                self.cur.execute("UPDATE owner SET email=%s WHERE id=%s", (email, owner_id))
+                self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error authenticating owner Gmail: {e}", exc_info=True)
+            return False
+
     def authenticate_owner_password(self, password):
         """
-        Authenticate owner using password.
+        Authenticate owner password against Firebase.
         
         Args:
             password: Password to check
@@ -649,15 +920,49 @@ class AttendanceBackend:
         Returns:
             bool: True if password matches, False otherwise
         """
+        ok, _ = self.verify_owner_password(password)
+        return ok
+
+    def verify_owner_password(self, password):
+        """
+        Verify owner password against Firebase using stored owner email.
+
+        Returns:
+            (bool, str): success flag and failure reason (if any)
+        """
         try:
-            self.cur.execute("SELECT password FROM owner")
+            if not password:
+                return False, "Password is required"
+
+            self.cur.execute("SELECT email FROM owner LIMIT 1")
             row = self.cur.fetchone()
             if not row:
-                return False
-            return row[0] == password
+                return False, "Owner account is not registered"
+
+            owner_email = (row[0] or "").strip().lower()
+            if not owner_email:
+                return False, "Owner setup is incomplete. Complete owner setup to continue."
+
+            firebase_api_key = self._resolve_firebase_api_key()
+            if not firebase_api_key:
+                return False, "Firebase API key is missing. Complete owner setup or update Settings."
+
+            payload = {
+                "email": owner_email,
+                "password": password.strip(),
+                "returnSecureToken": True
+            }
+            ok, result = self._firebase_auth_request(
+                "signInWithPassword",
+                payload,
+                firebase_api_key
+            )
+            if not ok:
+                return False, self._firebase_error_message(result)
+            return True, ""
         except Exception as e:
             logger.error(f"Error authenticating owner password: {e}", exc_info=True)
-            return False
+            return False, "Authentication failed due to an internal error"
 
     def delete_owner(self):
         """
@@ -749,7 +1054,7 @@ class AttendanceBackend:
             today = self._today()
 
             self.cur.execute("""
-            SELECT id FROM employees WHERE name=?
+            SELECT id FROM employees WHERE name=%s
             """, (name,))
             emp = self.cur.fetchone()
             if not emp:
@@ -760,7 +1065,7 @@ class AttendanceBackend:
 
             self.cur.execute("""
             SELECT id FROM attendance
-            WHERE employee_id=? AND date=?
+            WHERE employee_id=%s AND date=%s
             """, (emp_id, today))
 
             if self.cur.fetchone():
@@ -769,7 +1074,7 @@ class AttendanceBackend:
 
             self.cur.execute("""
             INSERT INTO attendance (employee_id, date, entry_time)
-            VALUES (?, ?, ?)
+            VALUES (%s, %s, %s)
             """, (emp_id, today, self._now()))
             self.conn.commit()
             logger.info(f"Marked entry for {name} at {self._now()}")
@@ -796,7 +1101,7 @@ class AttendanceBackend:
             today = self._today()
 
             self.cur.execute("""
-            SELECT id FROM employees WHERE name=?
+            SELECT id FROM employees WHERE name=%s
             """, (name,))
             emp = self.cur.fetchone()
             if not emp:
@@ -807,7 +1112,7 @@ class AttendanceBackend:
 
             self.cur.execute("""
             SELECT id FROM attendance
-            WHERE employee_id=? AND date=? AND exit_time IS NULL
+            WHERE employee_id=%s AND date=%s AND exit_time IS NULL
             """, (emp_id, today))
 
             row = self.cur.fetchone()
@@ -817,8 +1122,8 @@ class AttendanceBackend:
 
             self.cur.execute("""
             UPDATE attendance
-            SET exit_time=?
-            WHERE id=?
+            SET exit_time=%s
+            WHERE id=%s
             """, (self._now(), row[0]))
             self.conn.commit()
             logger.info(f"Marked exit for {name} at {self._now()}")
@@ -844,7 +1149,7 @@ class AttendanceBackend:
             SELECT e.name, e.role, a.entry_time, a.exit_time
             FROM attendance a
             JOIN employees e ON a.employee_id = e.id
-            WHERE a.date=?
+            WHERE a.date=%s
             ORDER BY e.name
             """, (today,))
             return self.cur.fetchall()
@@ -870,7 +1175,7 @@ class AttendanceBackend:
             SELECT e.name, e.role, a.entry_time, a.exit_time
             FROM attendance a
             JOIN employees e ON a.employee_id = e.id
-            WHERE a.date=?
+            WHERE a.date=%s
             ORDER BY e.name
             """, (date_str,))
             return self.cur.fetchall()
@@ -895,7 +1200,7 @@ class AttendanceBackend:
             SELECT e.name, e.role, a.date, a.entry_time, a.exit_time
             FROM attendance a
             JOIN employees e ON a.employee_id = e.id
-            WHERE substr(a.date,1,7)=?
+            WHERE substr(a.date,1,7)=%s
             ORDER BY a.date, e.name
             """, (ym,))
             return self.cur.fetchall()
