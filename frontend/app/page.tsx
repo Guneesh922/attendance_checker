@@ -1,7 +1,7 @@
 "use client";
 import { useState, useEffect } from "react";
 import Nav from "../components/Nav";
-import { getToday } from "../../lib/api";
+import { getToday } from "../lib/api";
 
 type Row = { name: string; role: string; entry: string | null; exit: string | null };
 
