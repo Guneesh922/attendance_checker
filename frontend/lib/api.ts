@@ -1,7 +1,8 @@
 import axios from "axios";
 import { auth } from "./firebase";
 
-const rawBase = process.env.NEXT_PUBLIC_API_URL || "";
+// Support both variable names in case of legacy instructions
+const rawBase = process.env.NEXT_PUBLIC_API_URL || process.env.NEXT_PUBLIC_BACKEND_URL || "";
 // Strip any trailing slash so `${BASE}/employees/` is always clean
 export const BASE = rawBase.replace(/\/+$/, "");
 console.log("Resolved API BASE URL:", BASE || "[EMPTY - NEXT_PUBLIC_API_URL IS MISSING]");
