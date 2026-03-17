@@ -1,9 +1,23 @@
 "use client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
+import { useRouter } from "next/navigation";
+import { onAuthStateChanged } from "firebase/auth";
+import { auth } from "../../lib/firebase";
 import Nav from "../../components/Nav";
 import { getSettings, saveSettings, saveEmailConfig } from "../../lib/api";
+import axios from "axios";
 
 export default function SettingsPage() {
+  const router = useRouter();
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  const [facesVerified, setFacesVerified] = useState(false);
+  const [showVerificationModal, setShowVerificationModal] = useState(false);
+  const [token, setToken] = useState<string>("");
+  const [verificationLoading, setVerificationLoading] = useState(false);
+  const [verificationError, setVerificationError] = useState("");
+  
   const [s, setS] = useState({
     min_work_hours: "4",
     late_after_time: "09:30:00",
@@ -15,12 +29,100 @@ export default function SettingsPage() {
     email_enabled: "0",
   });
   const [msg, setMsg] = useState("");
-
   useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (!user) {
+        router.replace("/login");
+        return;
+      }
+      const idToken = await user.getIdToken();
+      setToken(idToken);
+    });
+    return unsubscribe;
+  }, [router]);
+
+  // Initialize camera for face verification
+  useEffect(() => {
+    if (!showVerificationModal) return;
+    
+    const startCamera = async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: "user" },
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+        }
+      } catch (err) {
+        console.error("Camera access error:", err);
+        setVerificationError("Could not access camera. Please check permissions.");
+      }
+    };
+    
+    startCamera();
+    
+    return () => {
+      if (videoRef.current?.srcObject) {
+        (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
+      }
+    };
+  }, [showVerificationModal]);
+
+  async function verifyFace() {
+    if (!videoRef.current || !canvasRef.current) return;
+    
+    setVerificationLoading(true);
+    setVerificationError("");
+
+    try {
+      // Draw current frame to canvas
+      const ctx = canvasRef.current.getContext("2d");
+      if (!ctx) throw new Error("Could not get canvas context");
+      
+      ctx.drawImage(videoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
+      
+      // Convert canvas to blob
+      canvasRef.current.toBlob(async (blob) => {
+        if (!blob) throw new Error("Could not convert canvas to blob");
+        
+        const fd = new FormData();
+        fd.append("file", blob, "face.jpg");
+        
+        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+        
+        try {
+          const response = await axios.post(`${apiUrl}/auth/verify-owner-face`, fd, {
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          });
+          
+          if (response.data.authenticated) {
+            setFacesVerified(true);
+            setShowVerificationModal(false);
+          } else {
+            setVerificationError("Face not recognized. Please try again.");
+            setVerificationLoading(false);
+          }
+        } catch (err) {
+          console.error("Face verification error:", err);
+          setVerificationError("Failed to verify face. Please try again.");
+          setVerificationLoading(false);
+        }
+      }, "image/jpeg");
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : "Failed to verify face";
+      setVerificationError(errorMessage);
+      setVerificationLoading(false);
+    }
+  }  
+  useEffect(() => {
+    if (!facesVerified) return;
+    
     getSettings()
       .then((r) => setS((prev) => ({ ...prev, ...r.data })))
       .catch(console.error);
-  }, []);
+  }, [facesVerified]);
 
   function update(key: string, val: string) {
     setS((prev) => ({ ...prev, [key]: val }));
@@ -52,8 +154,53 @@ export default function SettingsPage() {
 
   return (
     <>
-      <Nav />
-      <main className="mx-auto max-w-2xl p-6 space-y-6">
+      {!facesVerified && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black/80 z-50">
+          <div className="card w-full max-w-sm">
+            <div className="mb-8 text-center">
+              <div className="mb-3 text-4xl">🔐</div>
+              <h1 className="text-2xl font-bold text-white">Verify Your Face</h1>
+              <p className="mt-1 text-sm text-slate-400">Verify your identity to access settings</p>
+            </div>
+
+            <div className="space-y-4">
+              <div className="relative overflow-hidden rounded-lg bg-slate-900">
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  className="h-64 w-full"
+                />
+                <canvas
+                  ref={canvasRef}
+                  width={320}
+                  height={256}
+                  className="hidden"
+                />
+              </div>
+
+              {verificationError && (
+                <p className="rounded-lg bg-red-900/40 p-3 text-sm text-red-300">
+                  {verificationError}
+                </p>
+              )}
+
+              <button
+                onClick={verifyFace}
+                disabled={verificationLoading}
+                className="btn-primary w-full"
+              >
+                {verificationLoading ? "Verifying face…" : "Verify Face"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {facesVerified && (
+        <>
+          <Nav />
+          <main className="mx-auto max-w-2xl p-6 space-y-6">
         <h1 className="text-2xl font-bold text-white">Settings</h1>
         {msg && <p className="text-sm text-slate-300">{msg}</p>}
 
@@ -111,6 +258,8 @@ export default function SettingsPage() {
           <button id="save-email-btn" className="btn-primary" onClick={saveEmail}>Save Email Settings</button>
         </div>
       </main>
+        </>
+      )}
     </>
   );
 }

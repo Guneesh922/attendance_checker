@@ -77,11 +77,25 @@ def _email_scheduler_loop() -> None:
                 subject, html = build_email_report(rows)
                 sender = backend.get_setting("email_sender", "")
                 pwd = backend.get_setting("email_app_password", "")
-                recips = backend.get_setting("email_recipients", "")
+                
+                # Get recipients: use owner's registration email + any additional recipients
+                owner_email = backend.get_owner_email()
+                custom_recips = backend.get_setting("email_recipients", "")
+                
+                # Build recipient list: owner email + custom recipients
+                recips_list = []
+                if owner_email:
+                    recips_list.append(owner_email)
+                if custom_recips:
+                    recips_list.extend([e.strip() for e in custom_recips.split(",") if e.strip()])
+                
+                recips = ",".join(recips_list) if recips_list else ""
+                
                 if sender and pwd and recips:
                     send_email_report(sender, pwd, recips, subject, html)
-        except Exception:
-            pass  # never crash the scheduler
+                    logger.info(f"Email report sent to: {recips}")
+        except Exception as e:
+            logger.error(f"Email scheduler error: {e}", exc_info=True)
 
 
 # ── Startup / shutdown ────────────────────────────────────────────────────────
@@ -175,6 +189,81 @@ def register_owner_endpoint(body: RegisterOwnerBody):
         return result
     except Exception as e:
         logger.error(f"Error registering owner: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/auth/register-owner-face", dependencies=[Depends(verify_token)])
+async def register_owner_face(
+    file: UploadFile = File(...),
+    token: dict = Depends(verify_token),
+):
+    """
+    Capture and store owner's face image during onboarding.
+    Called after owner signs up to enable face-based authentication.
+    
+    This allows the owner to later use face recognition to access
+    settings, add employees, and view data.
+    """
+    try:
+        owner_id = _get_owner_id(token)
+        data = await file.read()
+        frame = _decode_upload(data)
+        
+        # Encode frame to JPEG and upload to Cloudinary
+        ok, buf = cv2.imencode(".jpg", frame)
+        if not ok:
+            raise IOError("Failed to encode frame as JPEG")
+        
+        from api.storage import upload_face_image
+        img_url, blob_name = upload_face_image("owner", buf.tobytes())
+        
+        # Store owner face image URL in database
+        backend.cur.execute(
+            "UPDATE owner SET image_path=%s WHERE id=%s",
+            (img_url, owner_id)
+        )
+        backend.conn.commit()
+        
+        logger.info(f"Owner face registered successfully for owner_id {owner_id}")
+        return {"ok": True, "message": "Owner face registered successfully"}
+        
+    except Exception as e:
+        logger.error(f"Error registering owner face: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/auth/verify-owner-face", dependencies=[Depends(verify_token)])
+async def verify_owner_face(
+    body: FrameBody,
+    token: dict = Depends(verify_token),
+):
+    """
+    Verify owner's identity using face recognition.
+    Called before accessing protected settings or sensitive operations.
+    
+    Returns:
+      { "authenticated": true }  if face matches stored image
+      { "authenticated": false } if face does not match
+    """
+    try:
+        owner_id = _get_owner_id(token)
+        
+        # Decode base64 image
+        raw = base64.b64decode(body.image_b64)
+        frame = _decode_upload(raw)
+        
+        # Call backend face authentication
+        is_authenticated = backend.authenticate_owner(frame)
+        
+        logger.info(f"Owner face verification: {'SUCCESS' if is_authenticated else 'FAILED'} for owner_id {owner_id}")
+        
+        return {
+            "authenticated": is_authenticated,
+            "message": "Face verified successfully" if is_authenticated else "Face not recognized"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error verifying owner face: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

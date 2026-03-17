@@ -798,20 +798,33 @@ class AttendanceBackend:
             bool: True if authentication successful, False otherwise
         """
         try:
-            # Load owner face encoding from image file (more reliable)
+            # Load owner face encoding from URL (Cloudinary)
             self.cur.execute("SELECT image_path FROM owner")
             row = self.cur.fetchone()
             if not row:
                 return False
             
             img_path = row[0]
-            if not os.path.exists(img_path):
-                logger.warning(f"Owner image not found: {img_path}")
+            if not img_path or not img_path.startswith("https://"):
+                logger.warning(f"Owner image not found or invalid: {img_path}")
+                return False
+            
+            # Download image from URL and load it
+            try:
+                resp = requests.get(img_path, timeout=10)
+                resp.raise_for_status()
+                arr = numpy.frombuffer(resp.content, numpy.uint8)
+                img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img_bgr is None:
+                    logger.warning(f"Could not decode owner image from URL: {img_path}")
+                    return False
+                img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+            except Exception as e:
+                logger.error(f"Error downloading owner image from URL: {e}")
                 return False
             
             # Load stored face encoding
-            stored_img = face_recognition.load_image_file(img_path)
-            stored_encodings = face_recognition.face_encodings(stored_img)
+            stored_encodings = face_recognition.face_encodings(img)
             if not stored_encodings:
                 logger.warning("No face found in owner image")
                 return False
