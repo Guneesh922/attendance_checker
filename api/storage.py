@@ -3,12 +3,15 @@ import uuid
 import cloudinary
 import cloudinary.uploader
 
-cloudinary.config(
-    cloud_name = "duksi8dar",
-    api_key    = "817794938979822",
-    api_secret = "gAX9cJLxnllU-pCy_25vL49LXQo",
-    secure     = True
-)
+# Configure Cloudinary using environment variables as a fallback.
+# Note: If CLOUDINARY_URL is set (like on Railway), the SDK auto-configures itself.
+if os.environ.get("CLOUDINARY_CLOUD_NAME"):
+    cloudinary.config(
+        cloud_name = os.environ.get("CLOUDINARY_CLOUD_NAME"),
+        api_key    = os.environ.get("CLOUDINARY_API_KEY"),
+        api_secret = os.environ.get("CLOUDINARY_API_SECRET"),
+        secure     = True
+    )
 
 def upload_face_image(employee_name: str, image_bytes: bytes):
     """Upload JPEG bytes to Cloudinary, return (secure HTTPS URL, public_id)."""
