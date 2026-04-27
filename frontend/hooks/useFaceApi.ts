@@ -11,13 +11,15 @@ async function getFaceApi() {
   return faceapi;
 }
 
+const MODELS_URL = "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights";
+
 export async function loadModels() {
   const api = await getFaceApi();
   if (!modelsLoaded) {
     await Promise.all([
-      api.nets.ssdMobilenetv1.loadFromUri("/models"),
-      api.nets.faceLandmark68Net.loadFromUri("/models"),
-      api.nets.faceRecognitionNet.loadFromUri("/models"),
+      api.nets.ssdMobilenetv1.loadFromUri(MODELS_URL),
+      api.nets.faceLandmark68Net.loadFromUri(MODELS_URL),
+      api.nets.faceRecognitionNet.loadFromUri(MODELS_URL),
     ]);
     modelsLoaded = true;
   }
