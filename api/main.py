@@ -10,7 +10,7 @@ replicates the original App._whatsapp_tick email scheduler.
 Run locally:
   uvicorn api.main:app --reload --port 8000
 
-Docker / Railway:
+Docker / Render:
   uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 1
   (1 worker is intentional — face_recognition is not multi-worker safe)
 """
@@ -53,6 +53,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 
 # Singleton — all face encodings live here in RAM (~1.5 MB for 300 employees)
 backend: AttendanceBackend = None  # type: ignore[assignment]
