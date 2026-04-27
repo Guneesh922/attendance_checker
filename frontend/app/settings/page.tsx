@@ -1,265 +1,234 @@
 "use client";
-import { useState, useEffect, useRef } from "react";
-import { useRouter } from "next/navigation";
-import { onAuthStateChanged } from "firebase/auth";
-import { auth } from "../../lib/firebase";
-import Nav from "../../components/Nav";
-import { getSettings, saveSettings, saveEmailConfig } from "../../lib/api";
-import axios from "axios";
+import { useState, useEffect } from "react";
+import Layout from "../../components/Layout";
+import { supabase } from "../../lib/supabase";
+
+type Settings = {
+  arrival_time: string;
+  departure_time: string;
+  report_frequency: string;
+  report_email: string;
+  report_enabled: boolean;
+  smtp_user: string;
+  smtp_pass: string;
+};
+
+const DEFAULTS: Settings = {
+  arrival_time: "09:00",
+  departure_time: "17:00",
+  report_frequency: "weekly",
+  report_email: "",
+  report_enabled: false,
+  smtp_user: "",
+  smtp_pass: "",
+};
 
 export default function SettingsPage() {
-  const router = useRouter();
-  const videoRef = useRef<HTMLVideoElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  
-  const [facesVerified, setFacesVerified] = useState(false);
-  const [showVerificationModal, setShowVerificationModal] = useState(false);
-  const [token, setToken] = useState<string>("");
-  const [verificationLoading, setVerificationLoading] = useState(false);
-  const [verificationError, setVerificationError] = useState("");
-  
-  const [s, setS] = useState({
-    min_work_hours: "4",
-    late_after_time: "09:30:00",
-    min_departure_time: "17:00:00",
-    email_sender: "",
-    email_app_password: "",
-    email_recipients: "",
-    email_report_time: "18:00",
-    email_enabled: "0",
-  });
-  const [msg, setMsg] = useState("");
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (!user) {
-        router.replace("/login");
-        return;
-      }
-      const idToken = await user.getIdToken();
-      setToken(idToken);
-    });
-    return unsubscribe;
-  }, [router]);
+  const [s, setS] = useState<Settings>(DEFAULTS);
+  const [ownerId, setOwnerId] = useState<string | null>(null);
+  const [orgName, setOrgName] = useState("");
+  const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
+  const [saving, setSaving] = useState(false);
 
-  // Initialize camera for face verification
   useEffect(() => {
-    if (!showVerificationModal) return;
-    
-    const startCamera = async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: "user" },
+    async function load() {
+      const db = supabase();
+      const { data: owner } = await db.from("owners").select("id, org_name").single();
+      if (!owner) return;
+      setOwnerId(owner.id);
+      setOrgName(owner.org_name ?? "");
+
+      const { data: settings } = await db
+        .from("settings")
+        .select("*")
+        .eq("owner_id", owner.id)
+        .single();
+      if (settings) {
+        setS({
+          arrival_time:    settings.arrival_time?.slice(0, 5) ?? "09:00",
+          departure_time:  settings.departure_time?.slice(0, 5) ?? "17:00",
+          report_frequency: settings.report_frequency ?? "weekly",
+          report_email:    settings.report_email ?? "",
+          report_enabled:  settings.report_enabled ?? false,
+          smtp_user:       settings.smtp_user ?? "",
+          smtp_pass:       settings.smtp_pass ?? "",
         });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      } catch (err) {
-        console.error("Camera access error:", err);
-        setVerificationError("Could not access camera. Please check permissions.");
       }
-    };
-    
-    startCamera();
-    
-    return () => {
-      if (videoRef.current?.srcObject) {
-        (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
-      }
-    };
-  }, [showVerificationModal]);
-
-  async function verifyFace() {
-    if (!videoRef.current || !canvasRef.current) return;
-    
-    setVerificationLoading(true);
-    setVerificationError("");
-
-    try {
-      // Draw current frame to canvas
-      const ctx = canvasRef.current.getContext("2d");
-      if (!ctx) throw new Error("Could not get canvas context");
-      
-      ctx.drawImage(videoRef.current, 0, 0, canvasRef.current.width, canvasRef.current.height);
-      
-      // Convert canvas to blob
-      canvasRef.current.toBlob(async (blob) => {
-        if (!blob) throw new Error("Could not convert canvas to blob");
-        
-        const fd = new FormData();
-        fd.append("file", blob, "face.jpg");
-        
-        const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-        
-        try {
-          const response = await axios.post(`${apiUrl}/auth/verify-owner-face`, fd, {
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
-          });
-          
-          if (response.data.authenticated) {
-            setFacesVerified(true);
-            setShowVerificationModal(false);
-          } else {
-            setVerificationError("Face not recognized. Please try again.");
-            setVerificationLoading(false);
-          }
-        } catch (err) {
-          console.error("Face verification error:", err);
-          setVerificationError("Failed to verify face. Please try again.");
-          setVerificationLoading(false);
-        }
-      }, "image/jpeg");
-    } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : "Failed to verify face";
-      setVerificationError(errorMessage);
-      setVerificationLoading(false);
     }
-  }  
-  useEffect(() => {
-    if (!facesVerified) return;
-    
-    getSettings()
-      .then((r) => setS((prev) => ({ ...prev, ...r.data })))
-      .catch(console.error);
-  }, [facesVerified]);
+    load();
+  }, []);
 
-  function update(key: string, val: string) {
+  function update<K extends keyof Settings>(key: K, val: Settings[K]) {
     setS((prev) => ({ ...prev, [key]: val }));
   }
 
-  async function saveThresholds() {
+  async function save() {
+    if (!ownerId) return;
+    setSaving(true);
+    setMsg(null);
     try {
-      await saveSettings({
-        min_work_hours: s.min_work_hours,
-        late_after_time: s.late_after_time,
-        min_departure_time: s.min_departure_time,
-      });
-      setMsg("✅ Thresholds saved");
-    } catch { setMsg("❌ Save failed"); }
-  }
+      const db = supabase();
 
-  async function saveEmail() {
-    try {
-      await saveEmailConfig({
-        sender: s.email_sender,
-        app_password: s.email_app_password,
-        recipients: s.email_recipients,
-        report_time: s.email_report_time,
-        enabled: s.email_enabled === "1",
-      });
-      setMsg("✅ Email settings saved");
-    } catch { setMsg("❌ Save failed"); }
+      // Update org name
+      await db.from("owners").update({ org_name: orgName }).eq("id", ownerId);
+
+      // Upsert settings
+      const { error } = await db.from("settings").upsert(
+        { owner_id: ownerId, ...s, updated_at: new Date().toISOString() },
+        { onConflict: "owner_id" }
+      );
+      if (error) throw error;
+      setMsg({ text: "Settings saved successfully.", ok: true });
+    } catch {
+      setMsg({ text: "Failed to save settings.", ok: false });
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
-    <>
-      {!facesVerified && (
-        <div className="fixed inset-0 flex items-center justify-center bg-black/80 z-50">
-          <div className="card w-full max-w-sm">
-            <div className="mb-8 text-center">
-              <div className="mb-3 text-4xl">🔐</div>
-              <h1 className="text-2xl font-bold text-white">Verify Your Face</h1>
-              <p className="mt-1 text-sm text-slate-400">Verify your identity to access settings</p>
-            </div>
-
-            <div className="space-y-4">
-              <div className="relative overflow-hidden rounded-lg bg-slate-900">
-                <video
-                  ref={videoRef}
-                  autoPlay
-                  playsInline
-                  className="h-64 w-full"
-                />
-                <canvas
-                  ref={canvasRef}
-                  width={320}
-                  height={256}
-                  className="hidden"
-                />
-              </div>
-
-              {verificationError && (
-                <p className="rounded-lg bg-red-900/40 p-3 text-sm text-red-300">
-                  {verificationError}
-                </p>
-              )}
-
-              <button
-                onClick={verifyFace}
-                disabled={verificationLoading}
-                className="btn-primary w-full"
-              >
-                {verificationLoading ? "Verifying face…" : "Verify Face"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {facesVerified && (
-        <>
-          <Nav />
-          <main className="mx-auto max-w-2xl p-6 space-y-6">
+    <Layout>
+      <div className="mb-8">
         <h1 className="text-2xl font-bold text-white">Settings</h1>
-        {msg && <p className="text-sm text-slate-300">{msg}</p>}
+        <p className="mt-1 text-sm text-slate-400">Configure your attendance rules and email reports</p>
+      </div>
 
-        {/* Thresholds */}
+      <div className="mx-auto max-w-2xl space-y-6">
+        {/* Organization */}
         <div className="card space-y-4">
-          <h2 className="font-semibold text-white">Attendance Thresholds</h2>
+          <h2 className="font-semibold text-white">Organization</h2>
           <div>
-            <label className="label">Min Work Hours</label>
-            <input id="min-hours" className="input" type="number" step="0.5" value={s.min_work_hours}
-              onChange={(e) => update("min_work_hours", e.target.value)} />
+            <label className="label">Business / Organization Name</label>
+            <input
+              className="input"
+              value={orgName}
+              onChange={(e) => setOrgName(e.target.value)}
+              placeholder="Acme Corp"
+            />
           </div>
-          <div>
-            <label className="label">Late After (HH:MM:SS)</label>
-            <input id="late-time" className="input" value={s.late_after_time}
-              onChange={(e) => update("late_after_time", e.target.value)} />
-          </div>
-          <div>
-            <label className="label">Min Departure Time (HH:MM:SS)</label>
-            <input id="min-departure" className="input" value={s.min_departure_time}
-              onChange={(e) => update("min_departure_time", e.target.value)} />
-          </div>
-          <button id="save-thresholds-btn" className="btn-primary" onClick={saveThresholds}>Save Thresholds</button>
         </div>
 
-        {/* Email */}
+        {/* Work Hours */}
         <div className="card space-y-4">
-          <h2 className="font-semibold text-white">Email Report</h2>
-          <div>
-            <label className="label">Sender Gmail</label>
-            <input id="email-sender" className="input" type="email" value={s.email_sender}
-              onChange={(e) => update("email_sender", e.target.value)} />
-          </div>
-          <div>
-            <label className="label">Gmail App Password</label>
-            <input id="email-password" className="input" type="password" value={s.email_app_password}
-              onChange={(e) => update("email_app_password", e.target.value)} />
-          </div>
-          <div>
-            <label className="label">Recipients (comma-separated)</label>
-            <input id="email-recipients" className="input" value={s.email_recipients}
-              onChange={(e) => update("email_recipients", e.target.value)} />
-          </div>
-          <div className="flex gap-4 items-end">
-            <div className="flex-1">
-              <label className="label">Daily Send Time (HH:MM)</label>
-              <input id="email-time" className="input" value={s.email_report_time}
-                onChange={(e) => update("email_report_time", e.target.value)} />
+          <h2 className="font-semibold text-white">Work Hours</h2>
+          <p className="text-sm text-slate-400">
+            Employees arriving after the arrival time are marked as <span className="text-amber-400 font-medium">Late</span>.
+          </p>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="label">Arrival Time</label>
+              <input
+                className="input"
+                type="time"
+                value={s.arrival_time}
+                onChange={(e) => update("arrival_time", e.target.value)}
+              />
+              <p className="mt-1 text-xs text-slate-500">After this = late</p>
             </div>
-            <label className="flex items-center gap-2 text-sm text-slate-300 mb-1">
-              <input id="email-enabled" type="checkbox" checked={s.email_enabled === "1"}
-                onChange={(e) => update("email_enabled", e.target.checked ? "1" : "0")} />
-              Enabled
+            <div>
+              <label className="label">Departure Time</label>
+              <input
+                className="input"
+                type="time"
+                value={s.departure_time}
+                onChange={(e) => update("departure_time", e.target.value)}
+              />
+              <p className="mt-1 text-xs text-slate-500">Expected end of day</p>
+            </div>
+          </div>
+        </div>
+
+        {/* Email Reports */}
+        <div className="card space-y-4">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold text-white">Email Reports</h2>
+            <label className="flex cursor-pointer items-center gap-2">
+              <span className="text-sm text-slate-400">Enable</span>
+              <button
+                role="switch"
+                aria-checked={s.report_enabled}
+                onClick={() => update("report_enabled", !s.report_enabled)}
+                className={`relative h-6 w-11 rounded-full transition-colors ${s.report_enabled ? "bg-indigo-600" : "bg-slate-700"}`}
+              >
+                <span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${s.report_enabled ? "translate-x-5" : ""}`} />
+              </button>
             </label>
           </div>
-          <button id="save-email-btn" className="btn-primary" onClick={saveEmail}>Save Email Settings</button>
+
+          <p className="text-sm text-slate-400">
+            Receive a report of late and absent employees. Uses Gmail with an App Password.
+          </p>
+
+          <div>
+            <label className="label">Report Frequency</label>
+            <div className="flex gap-3">
+              {["weekly", "monthly"].map((freq) => (
+                <button
+                  key={freq}
+                  onClick={() => update("report_frequency", freq)}
+                  className={`rounded-lg px-4 py-2 text-sm font-medium transition-colors ${
+                    s.report_frequency === freq
+                      ? "bg-indigo-600 text-white"
+                      : "border border-slate-700 text-slate-400 hover:border-indigo-500"
+                  }`}
+                >
+                  {freq.charAt(0).toUpperCase() + freq.slice(1)}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <label className="label">Send Reports To</label>
+            <input
+              className="input"
+              type="email"
+              placeholder="you@company.com"
+              value={s.report_email}
+              onChange={(e) => update("report_email", e.target.value)}
+            />
+          </div>
+
+          <div className="rounded-lg border border-slate-700 bg-slate-800/50 p-4 space-y-3">
+            <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+              Gmail SMTP (for sending reports)
+            </p>
+            <div>
+              <label className="label">Gmail Address</label>
+              <input
+                className="input"
+                type="email"
+                placeholder="sender@gmail.com"
+                value={s.smtp_user}
+                onChange={(e) => update("smtp_user", e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="label">App Password</label>
+              <input
+                className="input"
+                type="password"
+                placeholder="xxxx xxxx xxxx xxxx"
+                value={s.smtp_pass}
+                onChange={(e) => update("smtp_pass", e.target.value)}
+              />
+              <p className="mt-1 text-xs text-slate-500">
+                Generate at Google Account → Security → App Passwords
+              </p>
+            </div>
+          </div>
         </div>
-      </main>
-        </>
-      )}
-    </>
+
+        {/* Save */}
+        {msg && (
+          <p className={`rounded-lg px-4 py-3 text-sm ${msg.ok ? "bg-emerald-900/30 text-emerald-300" : "bg-red-900/30 text-red-300"}`}>
+            {msg.text}
+          </p>
+        )}
+        <button className="btn-primary w-full" onClick={save} disabled={saving}>
+          {saving ? "Saving…" : "Save Settings"}
+        </button>
+      </div>
+    </Layout>
   );
 }
