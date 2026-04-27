@@ -4,6 +4,17 @@
 -- ============================================================
 
 -- ────────────────────────────────────────────────────────────
+-- DROP OLD TABLES (from previous schema with integer PKs)
+-- ────────────────────────────────────────────────────────────
+
+DROP TABLE IF EXISTS employee_images  CASCADE;
+DROP TABLE IF EXISTS attendance       CASCADE;
+DROP TABLE IF EXISTS employees        CASCADE;
+DROP TABLE IF EXISTS settings         CASCADE;
+DROP TABLE IF EXISTS owners           CASCADE;
+DROP TABLE IF EXISTS owner            CASCADE;
+
+-- ────────────────────────────────────────────────────────────
 -- TABLES
 -- ────────────────────────────────────────────────────────────
 
