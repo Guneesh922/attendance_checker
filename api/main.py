@@ -30,13 +30,16 @@ load_dotenv()
 
 import cv2
 import numpy as np
+import requests
+import face_recognition
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from firebase_admin import auth as fb_auth
 from pydantic import BaseModel
 
 from api.auth import verify_token
-from backend import AttendanceBackend
+from backend import AttendanceBackend, FACE_RECOGNITION_TOLERANCE
 from email_reporter import build_email_report, send_email_report
 
 logger = logging.getLogger(__name__)
@@ -164,6 +167,10 @@ class RegisterOwnerBody(BaseModel):
     organization_name: str
     uid: str
 
+class FaceLoginBody(BaseModel):
+    email: str
+    image_b64: str  # base64-encoded JPEG from the browser webcam canvas
+
 
 # ── Auth ──────────────────────────────────────────────────────────────────────
 
@@ -194,6 +201,84 @@ def register_owner_endpoint(body: RegisterOwnerBody):
         return result
     except Exception as e:
         logger.error(f"Error registering owner: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/auth/login-with-face")
+async def login_with_face(body: FaceLoginBody):
+    """
+    Authenticate an owner using face recognition and return a Firebase custom token.
+    No existing auth token required — this IS the login step.
+
+    Flow:
+      1. Look up owner by email → get stored face image URL and firebase_uid
+      2. Compare submitted face against stored face
+      3. On match → issue a Firebase custom token so the client can call
+         signInWithCustomToken() to complete login
+    """
+    try:
+        email = body.email.lower().strip()
+
+        # Fetch owner record by email
+        backend.cur.execute(
+            "SELECT id, image_path, firebase_uid FROM owner WHERE email=%s",
+            (email,)
+        )
+        row = backend.cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No account found for this email")
+
+        owner_id, img_path, firebase_uid = row
+
+        if not img_path or not img_path.startswith("https://"):
+            return {"authenticated": False, "reason": "no_face_registered"}
+
+        if not firebase_uid:
+            return {"authenticated": False, "reason": "account_incomplete"}
+
+        # Decode the submitted face image
+        try:
+            raw = base64.b64decode(body.image_b64)
+        except Exception:
+            raise HTTPException(status_code=400, detail="image_b64 is not valid base64")
+        frame = _decode_upload(raw)
+
+        # Download and compare against stored owner face
+        resp = requests.get(img_path, timeout=10)
+        resp.raise_for_status()
+        arr = np.frombuffer(resp.content, np.uint8)
+        stored_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if stored_bgr is None:
+            logger.warning(f"Could not decode stored owner image for {email}")
+            return {"authenticated": False, "reason": "stored_image_invalid"}
+
+        stored_rgb = cv2.cvtColor(stored_bgr, cv2.COLOR_BGR2RGB)
+        stored_encs = face_recognition.face_encodings(stored_rgb)
+        if not stored_encs:
+            return {"authenticated": False, "reason": "no_face_in_stored_image"}
+
+        live_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        live_encs = face_recognition.face_encodings(live_rgb)
+        if not live_encs:
+            return {"authenticated": False, "reason": "no_face_detected"}
+
+        matches = face_recognition.compare_faces([stored_encs[0]], live_encs[0], tolerance=FACE_RECOGNITION_TOLERANCE)
+        if not matches[0]:
+            logger.info(f"Face login failed for {email}")
+            return {"authenticated": False, "reason": "face_mismatch"}
+
+        # Face matched — create a Firebase custom token
+        custom_token = fb_auth.create_custom_token(firebase_uid)
+        # create_custom_token returns bytes
+        token_str = custom_token.decode("utf-8") if isinstance(custom_token, bytes) else custom_token
+
+        logger.info(f"Face login SUCCESS for {email}")
+        return {"authenticated": True, "custom_token": token_str}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in login-with-face: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 

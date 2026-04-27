@@ -37,6 +37,11 @@ CREATE TABLE IF NOT EXISTS attendance (
     exit_time   TEXT           -- HH:MM:SS or NULL
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
+
 -- Critical for 300-employee performance.
 -- Monthly report (300 × 30 = 9,000 rows) runs in < 10ms with these indexes.
 CREATE INDEX IF NOT EXISTS idx_attendance_date
@@ -44,6 +49,7 @@ CREATE INDEX IF NOT EXISTS idx_attendance_date
 
 CREATE INDEX IF NOT EXISTS idx_attendance_emp_date
     ON attendance(employee_id, date);
+
 INSERT INTO settings (key, value) VALUES
     ('min_work_hours',    '4'),
     ('late_after_time',   '09:30:00'),
