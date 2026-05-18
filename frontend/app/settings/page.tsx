@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect } from "react";
+import { useRouter } from "next/navigation";
 import Layout from "../../components/Layout";
 import { supabase } from "../../lib/supabase";
 
@@ -24,16 +25,24 @@ const DEFAULTS: Settings = {
 };
 
 export default function SettingsPage() {
+  const router = useRouter();
   const [s, setS] = useState<Settings>(DEFAULTS);
   const [ownerId, setOwnerId] = useState<string | null>(null);
   const [orgName, setOrgName] = useState("");
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [saving, setSaving] = useState(false);
+  const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [deleting, setDeleting] = useState(false);
 
   useEffect(() => {
     async function load() {
       const db = supabase();
-      const { data: owner } = await db.from("owners").select("id, org_name").single();
+
+      // Get the auth user's email to use as the default report email
+      const { data: { user } } = await db.auth.getUser();
+      const accountEmail = user?.email ?? "";
+
+      const { data: owner } = await db.from("owners").select("id, org_name, email").single();
       if (!owner) return;
       setOwnerId(owner.id);
       setOrgName(owner.org_name ?? "");
@@ -45,13 +54,14 @@ export default function SettingsPage() {
         .single();
       if (settings) {
         setS({
-          arrival_time:    settings.arrival_time?.slice(0, 5) ?? "09:00",
-          departure_time:  settings.departure_time?.slice(0, 5) ?? "17:00",
+          arrival_time:     settings.arrival_time?.slice(0, 5) ?? "09:00",
+          departure_time:   settings.departure_time?.slice(0, 5) ?? "17:00",
           report_frequency: settings.report_frequency ?? "weekly",
-          report_email:    settings.report_email ?? "",
-          report_enabled:  settings.report_enabled ?? false,
-          smtp_user:       settings.smtp_user ?? "",
-          smtp_pass:       settings.smtp_pass ?? "",
+          // Fall back to the owner's account email if no report email is set yet
+          report_email:     settings.report_email || accountEmail,
+          report_enabled:   settings.report_enabled ?? false,
+          smtp_user:        settings.smtp_user ?? "",
+          smtp_pass:        settings.smtp_pass ?? "",
         });
       }
     }
@@ -228,7 +238,70 @@ export default function SettingsPage() {
         <button className="btn-primary w-full" onClick={save} disabled={saving}>
           {saving ? "Saving…" : "Save Settings"}
         </button>
+
+        {/* Danger zone */}
+        <div className="card space-y-4 border-red-900/40 bg-red-950/10">
+          <h2 className="font-semibold text-red-400">Danger Zone</h2>
+          <p className="text-sm text-slate-400">
+            Permanently delete your account and all data — employees, attendance records, and settings.
+            This cannot be undone.
+          </p>
+          {!deleteConfirm ? (
+            <button
+              className="rounded-lg border border-red-800 bg-red-950/30 px-4 py-2 text-sm font-medium text-red-400 hover:bg-red-900/40 transition-colors"
+              onClick={() => setDeleteConfirm(true)}
+            >
+              Delete Account
+            </button>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-sm font-medium text-red-300">
+                Are you absolutely sure? Type DELETE to confirm.
+              </p>
+              <DeleteConfirmInput
+                onConfirmed={async () => {
+                  setDeleting(true);
+                  const db = supabase();
+                  await db.auth.signOut();
+                  // Supabase cascade deletes owners → employees → attendance → settings
+                  await db.rpc("delete_my_account");
+                  router.replace("/login");
+                }}
+                onCancel={() => setDeleteConfirm(false)}
+                deleting={deleting}
+              />
+            </div>
+          )}
+        </div>
       </div>
     </Layout>
+  );
+}
+
+function DeleteConfirmInput({
+  onConfirmed, onCancel, deleting,
+}: {
+  onConfirmed: () => void;
+  onCancel: () => void;
+  deleting: boolean;
+}) {
+  const [val, setVal] = useState("");
+  return (
+    <div className="flex gap-2">
+      <input
+        className="input flex-1"
+        placeholder="Type DELETE"
+        value={val}
+        onChange={(e) => setVal(e.target.value)}
+      />
+      <button
+        className="rounded-lg bg-red-700 px-4 py-2 text-sm font-medium text-white hover:bg-red-600 disabled:opacity-50 transition-colors"
+        disabled={val !== "DELETE" || deleting}
+        onClick={onConfirmed}
+      >
+        {deleting ? "Deleting…" : "Confirm"}
+      </button>
+      <button className="btn-ghost text-sm" onClick={onCancel}>Cancel</button>
+    </div>
   );
 }

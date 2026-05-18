@@ -70,10 +70,21 @@ CREATE TABLE IF NOT EXISTS settings (
 
 CREATE OR REPLACE FUNCTION handle_new_user()
 RETURNS TRIGGER LANGUAGE plpgsql SECURITY DEFINER AS $$
+DECLARE
+  new_owner_id UUID;
 BEGIN
   INSERT INTO owners (user_id, email, org_name)
   VALUES (NEW.id, NEW.email, 'My Organization')
-  ON CONFLICT (user_id) DO NOTHING;
+  ON CONFLICT (user_id) DO NOTHING
+  RETURNING id INTO new_owner_id;
+
+  -- Also seed a default settings row so .single() never errors for new users
+  IF new_owner_id IS NOT NULL THEN
+    INSERT INTO settings (owner_id)
+    VALUES (new_owner_id)
+    ON CONFLICT (owner_id) DO NOTHING;
+  END IF;
+
   RETURN NEW;
 END;
 $$;
@@ -127,18 +138,29 @@ CREATE POLICY "settings_all" ON settings FOR ALL
 -- Run this block separately if bucket doesn't exist yet
 -- ────────────────────────────────────────────────────────────
 
+-- Private bucket: photos are only accessible to the owning user via signed URLs
 INSERT INTO storage.buckets (id, name, public)
-VALUES ('employee-photos', 'employee-photos', true)
-ON CONFLICT (id) DO NOTHING;
+VALUES ('employee-photos', 'employee-photos', false)
+ON CONFLICT (id) DO UPDATE SET public = false;
 
 DROP POLICY IF EXISTS "photos_owner_insert" ON storage.objects;
 CREATE POLICY "photos_owner_insert" ON storage.objects FOR INSERT
-  WITH CHECK (bucket_id = 'employee-photos' AND auth.uid() IS NOT NULL);
+  WITH CHECK (
+    bucket_id = 'employee-photos'
+    AND (storage.foldername(name))[1] = auth.uid()::text
+  );
 
 DROP POLICY IF EXISTS "photos_public_select" ON storage.objects;
-CREATE POLICY "photos_public_select" ON storage.objects FOR SELECT
-  USING (bucket_id = 'employee-photos');
+DROP POLICY IF EXISTS "photos_owner_select"  ON storage.objects;
+CREATE POLICY "photos_owner_select" ON storage.objects FOR SELECT
+  USING (
+    bucket_id = 'employee-photos'
+    AND (storage.foldername(name))[1] = auth.uid()::text
+  );
 
 DROP POLICY IF EXISTS "photos_owner_delete" ON storage.objects;
 CREATE POLICY "photos_owner_delete" ON storage.objects FOR DELETE
-  USING (bucket_id = 'employee-photos' AND auth.uid() IS NOT NULL);
+  USING (
+    bucket_id = 'employee-photos'
+    AND (storage.foldername(name))[1] = auth.uid()::text
+  );

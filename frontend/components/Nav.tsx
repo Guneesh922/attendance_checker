@@ -4,12 +4,12 @@ import { usePathname, useRouter } from "next/navigation";
 import { supabase } from "../lib/supabase";
 
 const LINKS = [
-  { href: "/",           label: "Dashboard",  icon: "◈" },
-  { href: "/employees",  label: "Employees",  icon: "⊹" },
-  { href: "/attendance", label: "Scanner",    icon: "◉" },
-  { href: "/records",    label: "Records",    icon: "☰" },
-  { href: "/reports",    label: "Reports",    icon: "↗" },
-  { href: "/settings",   label: "Settings",   icon: "⚙" },
+  { href: "/",           label: "Dashboard", icon: "◈" },
+  { href: "/employees",  label: "Employees", icon: "⊹" },
+  { href: "/attendance", label: "Scanner",   icon: "◉" },
+  { href: "/records",    label: "Records",   icon: "☰" },
+  { href: "/reports",    label: "Reports",   icon: "₹" },
+  { href: "/settings",   label: "Settings",  icon: "⚙" },
 ];
 
 export default function Nav() {

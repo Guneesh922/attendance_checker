@@ -17,16 +17,18 @@ export default function AttendancePage() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [detected, setDetected] = useState<DetectedFace[]>([]);
   const [status, setStatus] = useState<AttendanceStatus>({});
-  const [autoMode, setAutoMode] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [todayRows, setTodayRows] = useState<Array<{ name: string; role: string; entry_time: string | null; exit_time: string | null }>>([]);
+  // Tracks which detected faces have the exception panel open
+  const [exceptionOpen, setExceptionOpen] = useState<Set<string>>(new Set());
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const autoMarkedRef = useRef<Set<string>>(new Set());
+  // Tracks what action was auto-taken per person this session
+  const autoMarkedRef = useRef<Map<string, "entry" | "exit">>(new Map());
 
   const loadEmployees = useCallback(async () => {
     const { data } = await supabase().from("employees").select("id, name, role, face_descriptors");
@@ -92,29 +94,52 @@ export default function AttendancePage() {
     }
   }, [detected]);
 
-  // Auto-mode: mark entry once per session per person
+  // Always-on auto-mode: entry before 2 PM, exit after 2 PM
   useEffect(() => {
-    if (!autoMode) return;
+    if (!cameraActive) return;
+    const isPastCutoff = new Date().getHours() >= 14;
+
     detected
-      .filter((f) => f.name && !autoMarkedRef.current.has(f.name))
+      .filter((f) => f.name)
       .forEach(async (f) => {
-        if (!f.name) return;
-        autoMarkedRef.current.add(f.name);
-        const ok = await markEntry(f.name);
-        setStatus((s) => ({ ...s, [f.name!]: ok ? "Auto-entered" : "Already in" }));
-        loadToday();
+        const name = f.name!;
+        const already = autoMarkedRef.current.get(name);
+        const todayRecord = todayRows.find((r) => r.name === name);
+
+        if (!todayRecord?.entry_time) {
+          // No entry yet — mark entry regardless of time
+          if (already !== "entry") {
+            autoMarkedRef.current.set(name, "entry");
+            const ok = await markEntry(name);
+            setStatus((s) => ({ ...s, [name]: ok ? "Entered" : "Already in" }));
+            loadToday();
+          }
+        } else if (!todayRecord?.exit_time && isPastCutoff) {
+          // Entry exists, no exit, past 2 PM — mark exit
+          if (already !== "exit") {
+            autoMarkedRef.current.set(name, "exit");
+            const ok = await markExit(name);
+            setStatus((s) => ({ ...s, [name]: ok ? "Exited" : "Already out" }));
+            loadToday();
+          }
+        }
       });
-  }, [detected, autoMode, loadToday]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detected, cameraActive]);
+
+  // Attach stream to video element once it mounts
+  useEffect(() => {
+    if (cameraActive && videoRef.current && streamRef.current) {
+      videoRef.current.srcObject = streamRef.current;
+      videoRef.current.play().catch(() => {});
+    }
+  }, [cameraActive]);
 
   async function startCamera() {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
     });
     streamRef.current = stream;
-    if (videoRef.current) {
-      videoRef.current.srcObject = stream;
-      await videoRef.current.play();
-    }
     setCameraActive(true);
     startScanning();
   }
@@ -125,7 +150,8 @@ export default function AttendancePage() {
     streamRef.current = null;
     setCameraActive(false);
     setDetected([]);
-    autoMarkedRef.current.clear();
+    setExceptionOpen(new Set());
+    autoMarkedRef.current = new Map();
     const ctx = canvasRef.current?.getContext("2d");
     if (ctx && canvasRef.current) ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
   }
@@ -133,10 +159,25 @@ export default function AttendancePage() {
   function startScanning() {
     setScanning(true);
     intervalRef.current = setInterval(async () => {
-      if (!videoRef.current || faceApiStatus !== "ready") return;
+      const video = videoRef.current;
+      if (!video || faceApiStatus !== "ready" || !video.videoWidth) return;
       try {
-        const faces = await detectAndMatch(videoRef.current, employees);
-        setDetected(faces);
+        const MAX_W = 320;
+        const scale = Math.min(1, MAX_W / video.videoWidth);
+        const w = Math.round(video.videoWidth * scale);
+        const h = Math.round(video.videoHeight * scale);
+        const tmp = document.createElement("canvas");
+        tmp.width = w; tmp.height = h;
+        tmp.getContext("2d")!.drawImage(video, 0, 0, w, h);
+        const faces = await detectAndMatch(tmp, employees);
+        const upscaled = faces.map((f) => ({
+          ...f,
+          box: {
+            top: f.box.top / scale, right: f.box.right / scale,
+            bottom: f.box.bottom / scale, left: f.box.left / scale,
+          },
+        }));
+        setDetected(upscaled);
       } catch { /* ignore single-frame errors */ }
     }, 1500);
   }
@@ -146,12 +187,8 @@ export default function AttendancePage() {
     setScanning(false);
   }
 
-  // Re-start scanning when employees load (so matcher has data)
   useEffect(() => {
-    if (cameraActive && scanning) {
-      stopScanning();
-      startScanning();
-    }
+    if (cameraActive && scanning) { stopScanning(); startScanning(); }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [employees]);
 
@@ -161,13 +198,11 @@ export default function AttendancePage() {
     const { data: owner } = await db.from("owners").select("id").single();
     const { data: emp } = await db.from("employees").select("id").eq("name", empName).single();
     if (!owner || !emp) return false;
-
     const { data: settings } = await db.from("settings").select("arrival_time").eq("owner_id", owner.id).single();
     const arrivalTime = settings?.arrival_time ?? "09:00:00";
     const now = new Date();
     const [h, m] = arrivalTime.split(":").map(Number);
     const isLate = now.getHours() > h || (now.getHours() === h && now.getMinutes() > m);
-
     const { error } = await db.from("attendance").upsert(
       { employee_id: emp.id, owner_id: owner.id, date: today, entry_time: now.toISOString(), is_late: isLate },
       { onConflict: "employee_id,date", ignoreDuplicates: true }
@@ -187,7 +222,16 @@ export default function AttendancePage() {
     return !error;
   }
 
+  function toggleException(name: string) {
+    setExceptionOpen((prev) => {
+      const next = new Set(prev);
+      next.has(name) ? next.delete(name) : next.add(name);
+      return next;
+    });
+  }
+
   const recognizedNames = detected.filter((f) => f.name).map((f) => f.name!);
+  const isPastCutoff = new Date().getHours() >= 14;
 
   return (
     <Layout>
@@ -196,25 +240,12 @@ export default function AttendancePage() {
           <h1 className="text-2xl font-bold text-white">Attendance Scanner</h1>
           <p className="mt-1 text-sm text-slate-400">
             {faceApiStatus === "ready"
-              ? `${employees.length} employee${employees.length !== 1 ? "s" : ""} loaded`
+              ? `${employees.length} employee${employees.length !== 1 ? "s" : ""} loaded · Auto-marking ${isPastCutoff ? "exits" : "entries"}`
               : faceApiStatus === "loading"
               ? "Loading face recognition…"
               : "Face recognition unavailable"}
           </p>
         </div>
-        {cameraActive && (
-          <label className="flex cursor-pointer items-center gap-2.5">
-            <span className="text-sm text-slate-300">Auto-mode</span>
-            <button
-              role="switch"
-              aria-checked={autoMode}
-              onClick={() => setAutoMode((v) => !v)}
-              className={`relative h-6 w-11 rounded-full transition-colors ${autoMode ? "bg-indigo-600" : "bg-slate-700"}`}
-            >
-              <span className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${autoMode ? "translate-x-5" : ""}`} />
-            </button>
-          </label>
-        )}
       </div>
 
       <div className="grid gap-6 lg:grid-cols-2">
@@ -256,41 +287,63 @@ export default function AttendancePage() {
             <div className="space-y-2">
               {detected.map((face, i) => {
                 if (!face.name) return null;
+                const name = face.name;
+                const isExceptionOpen = exceptionOpen.has(name);
                 return (
                   <div
-                    key={`${face.name}-${i}`}
-                    className="flex items-center justify-between rounded-xl border border-slate-700 bg-slate-800/50 px-4 py-3"
+                    key={`${name}-${i}`}
+                    className="rounded-xl border border-slate-700 bg-slate-800/50 px-4 py-3 space-y-2"
                   >
-                    <div>
-                      <p className="font-semibold text-white">{face.name}</p>
-                      {status[face.name] && (
-                        <p className="text-xs text-slate-400">{status[face.name]}</p>
-                      )}
-                    </div>
-                    <div className="flex gap-2">
-                      {!autoMode && (
-                        <button
-                          className="btn-primary text-xs"
-                          onClick={async () => {
-                            const ok = await markEntry(face.name!);
-                            setStatus((s) => ({ ...s, [face.name!]: ok ? "Entry marked" : "Already entered" }));
-                            loadToday();
-                          }}
-                        >
-                          Entering
-                        </button>
-                      )}
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <p className="font-semibold text-white">{name}</p>
+                        {status[name] && (
+                          <p className="text-xs text-emerald-400">{status[name]}</p>
+                        )}
+                      </div>
+                      {/* Exception button — for unusual situations only */}
                       <button
-                        className="btn-ghost text-xs"
-                        onClick={async () => {
-                          const ok = await markExit(face.name!);
-                          setStatus((s) => ({ ...s, [face.name!]: ok ? "Exit marked" : "No entry today" }));
-                          loadToday();
-                        }}
+                        className="rounded-lg border border-amber-700/60 bg-amber-900/20 px-3 py-1.5 text-xs font-medium text-amber-300 hover:bg-amber-900/40 transition-colors"
+                        onClick={() => toggleException(name)}
                       >
-                        Leaving
+                        {isExceptionOpen ? "Cancel" : "Exception"}
                       </button>
                     </div>
+
+                    {/* Exception panel: manual override */}
+                    {isExceptionOpen && (
+                      <div className="rounded-lg border border-amber-700/30 bg-amber-950/30 px-3 py-2.5 space-y-2">
+                        <p className="text-xs text-amber-400 font-medium">
+                          Manual override — use only when auto-detection is wrong
+                        </p>
+                        <div className="flex gap-2">
+                          <button
+                            className="btn-primary text-xs flex-1"
+                            onClick={async () => {
+                              autoMarkedRef.current.set(name, "entry");
+                              const ok = await markEntry(name);
+                              setStatus((s) => ({ ...s, [name]: ok ? "Entry overridden" : "Already entered" }));
+                              toggleException(name);
+                              loadToday();
+                            }}
+                          >
+                            Force Entry
+                          </button>
+                          <button
+                            className="btn-ghost text-xs flex-1"
+                            onClick={async () => {
+                              autoMarkedRef.current.set(name, "exit");
+                              const ok = await markExit(name);
+                              setStatus((s) => ({ ...s, [name]: ok ? "Exit overridden" : "No entry today" }));
+                              toggleException(name);
+                              loadToday();
+                            }}
+                          >
+                            Force Exit
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 );
               })}

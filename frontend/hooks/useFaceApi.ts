@@ -5,13 +5,17 @@ import { useEffect, useState } from "react";
 let faceapi: typeof import("face-api.js") | null = null;
 let modelsLoaded = false;
 
+// Cached FaceMatcher — rebuilt only when the employee list changes
+let cachedMatcher: InstanceType<(typeof import("face-api.js"))["FaceMatcher"]> | null = null;
+let cachedMatcherKey = "";
+
 async function getFaceApi() {
   if (typeof window === "undefined") throw new Error("Browser only");
   if (!faceapi) faceapi = await import("face-api.js");
   return faceapi;
 }
 
-const MODELS_URL = "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/weights";
+const MODELS_URL = "/models";
 
 export async function loadModels() {
   const api = await getFaceApi();
@@ -26,8 +30,7 @@ export async function loadModels() {
   return api;
 }
 
-/** Extract one face descriptor from a canvas snapshot of the current video frame.
- *  Returns null if no face is detected. */
+/** Extract one face descriptor from a canvas. Returns null if no face detected. */
 export async function extractDescriptorFromCanvas(
   canvas: HTMLCanvasElement
 ): Promise<number[] | null> {
@@ -44,30 +47,44 @@ export interface DetectedFace {
   box: { top: number; right: number; bottom: number; left: number };
 }
 
-/** Detect all faces in a video element and match against stored employee descriptors. */
+type EmployeeInput = { name: string; face_descriptors: number[][] };
+
+/**
+ * Detect all faces in a video or canvas element and match against stored employee descriptors.
+ * FaceMatcher is cached and only rebuilt when the employee list changes.
+ */
 export async function detectAndMatch(
-  videoEl: HTMLVideoElement,
-  employees: Array<{ name: string; face_descriptors: number[][] }>
+  input: HTMLVideoElement | HTMLCanvasElement,
+  employees: EmployeeInput[]
 ): Promise<DetectedFace[]> {
   const api = await loadModels();
   const detections = await api
-    .detectAllFaces(videoEl, new api.SsdMobilenetv1Options({ minConfidence: 0.5 }))
+    .detectAllFaces(input, new api.SsdMobilenetv1Options({ minConfidence: 0.5 }))
     .withFaceLandmarks()
     .withFaceDescriptors();
 
   if (!detections.length) return [];
 
-  const labeled = employees
-    .filter((e) => e.face_descriptors?.length > 0)
-    .map(
-      (e) =>
-        new api.LabeledFaceDescriptors(
-          e.name,
-          e.face_descriptors.map((d) => new Float32Array(d))
-        )
-    );
+  // Rebuild matcher only when the employee list actually changes
+  const matcherKey = employees
+    .map((e) => `${e.name}:${e.face_descriptors.length}`)
+    .join(",");
 
-  if (!labeled.length) {
+  if (matcherKey !== cachedMatcherKey) {
+    const labeled = employees
+      .filter((e) => e.face_descriptors?.length > 0)
+      .map(
+        (e) =>
+          new api.LabeledFaceDescriptors(
+            e.name,
+            e.face_descriptors.map((d) => new Float32Array(d))
+          )
+      );
+    cachedMatcher = labeled.length ? new api.FaceMatcher(labeled, 0.5) : null;
+    cachedMatcherKey = matcherKey;
+  }
+
+  if (!cachedMatcher) {
     return detections.map((d) => ({
       name: null,
       box: {
@@ -79,7 +96,7 @@ export async function detectAndMatch(
     }));
   }
 
-  const matcher = new api.FaceMatcher(labeled, 0.5);
+  const matcher = cachedMatcher;
   return detections.map((d) => {
     const match = matcher.findBestMatch(d.descriptor);
     return {

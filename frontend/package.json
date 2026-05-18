@@ -3,8 +3,6 @@
   "version": "2.0.0",
   "private": true,
   "scripts": {
-    "predev": "node scripts/download-models.js",
-    "prebuild": "node scripts/download-models.js",
     "dev": "next dev",
     "build": "next build",
     "start": "next start",

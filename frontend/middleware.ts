@@ -17,30 +17,38 @@ export async function middleware(request: NextRequest) {
     return NextResponse.next();
   }
 
-  // Build a response we can attach cookie mutations to
-  const response = NextResponse.next({ request });
+  // Build a mutable response; recreated inside setAll if cookies need updating
+  let response = NextResponse.next({ request });
 
-  const supabase = createServerClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
-    {
-      cookies: {
-        getAll: () => request.cookies.getAll(),
-        setAll: (cookiesToSet: Array<{ name: string; value: string; options?: Record<string, unknown> }>) => {
-          cookiesToSet.forEach(({ name, value, options }) => {
-            response.cookies.set(name, value, options as Parameters<typeof response.cookies.set>[2]);
-          });
+  try {
+    const supabase = createServerClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          getAll: () => request.cookies.getAll(),
+          setAll: (cookiesToSet: Array<{ name: string; value: string; options?: object }>) => {
+            // Mirror new cookies onto both request and response (required by @supabase/ssr)
+            cookiesToSet.forEach(({ name, value }) => request.cookies.set(name, value));
+            response = NextResponse.next({ request });
+            cookiesToSet.forEach(({ name, value, options }) =>
+              response.cookies.set(name, value, options)
+            );
+          },
         },
-      },
+      }
+    );
+
+    const { data: { user } } = await supabase.auth.getUser();
+
+    if (!user) {
+      return NextResponse.redirect(new URL("/login", request.url));
     }
-  );
-
-  const { data: { user } } = await supabase.auth.getUser();
-
-  if (!user) {
+    return response;
+  } catch {
+    // On any auth error, redirect to login rather than surfacing a 500
     return NextResponse.redirect(new URL("/login", request.url));
   }
-  return response;
 }
 
 export const config = {
